@@ -1,0 +1,32 @@
+START HERE: TradingView -> Telegram
+
+ไฟล์หลักอยู่ในโฟลเดอร์เดียวกันนี้
+
+1. ดับเบิลคลิก EDIT_TRADINGVIEW_TELEGRAM_CONFIG.cmd
+   ใส่ค่า:
+   - TELEGRAM_BOT_TOKEN
+   - TELEGRAM_CHAT_ID
+   - TRADINGVIEW_WEBHOOK_SECRET (ถ้าต้องการ)
+
+2. ลองระบบก่อน
+   ดับเบิลคลิก RUN_TRADINGVIEW_WEBHOOK_DRYRUN.cmd
+
+3. ทดสอบ local webhook
+   ดับเบิลคลิก TEST_TRADINGVIEW_WEBHOOK_LOCAL.cmd
+
+4. ใช้งานจริง
+   ดับเบิลคลิก RUN_TRADINGVIEW_WEBHOOK_LIVE.cmd
+
+5. สร้าง Alert ใน TradingView
+   - เปิดไฟล์ TradingView_Market_Prediction_Alert_v1.pine
+   - Add to chart
+   - Create Alert
+   - Condition: Any alert() function call
+   - Frequency: Once Per Bar Close
+   - Webhook URL: public https URL ของเครื่องนี้ + /webhook/tradingview
+
+ไฟล์ Pine Script:
+TradingView_Market_Prediction_Alert_v1.pine
+
+คู่มือเต็ม:
+README_TRADINGVIEW_ALERTS_TH.md
