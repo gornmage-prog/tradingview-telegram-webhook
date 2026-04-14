@@ -767,11 +767,41 @@ def fetch_stooq_candles(api_key: str, symbol: str, interval: str) -> list[Candle
 
 def fetch_yahoo_candles(symbol: str, interval: str = "5m", range_name: str = "5d") -> list[Candle]:
     encoded_symbol = urllib.parse.quote(symbol, safe="")
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
-        f"?interval={urllib.parse.quote(interval)}&range={urllib.parse.quote(range_name)}&includePrePost=true"
-    )
-    data = get_json(url)
+    urls = [
+        (
+            f"https://query2.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
+            f"?interval={urllib.parse.quote(interval)}&range={urllib.parse.quote(range_name)}&includePrePost=true"
+        ),
+        (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
+            f"?interval={urllib.parse.quote(interval)}&range={urllib.parse.quote(range_name)}&includePrePost=true"
+        ),
+    ]
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/135.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://finance.yahoo.com/quote/{encoded_symbol}",
+        "Origin": "https://finance.yahoo.com",
+    }
+    data: dict[str, Any] | None = None
+    last_error: str | None = None
+    for url in urls:
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = response.read().decode("utf-8")
+            data = json.loads(payload)
+            break
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+    if data is None:
+        raise RuntimeError(f"Yahoo Finance request failed: {last_error or 'unknown_error'}")
     if not isinstance(data, dict):
         raise RuntimeError("Yahoo Finance returned an unexpected response.")
     chart = data.get("chart")
