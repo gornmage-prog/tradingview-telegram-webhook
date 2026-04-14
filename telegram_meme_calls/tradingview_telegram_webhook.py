@@ -10,6 +10,7 @@ same Python setup already used by the Telegram project in this folder.
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import json
 import os
@@ -17,6 +18,8 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
+import io
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
@@ -332,6 +335,10 @@ def save_state(path: Path, state: dict[str, Any]) -> None:
     path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def parse_yahoo_timestamp(value: int | float) -> datetime:
+    return datetime.fromtimestamp(float(value), tz=timezone.utc)
+
+
 def fetch_twelvedata_candles(api_key: str, symbol: str, interval: str, outputsize: int = 260) -> list[Candle]:
     query_symbol = urllib.parse.quote(symbol, safe="/")
     url = (
@@ -553,9 +560,12 @@ def evaluate_signal(candles: list[Candle], htf_candles: list[Candle], config: Si
 
 def build_xau_message(signal: dict[str, Any]) -> str:
     timestamp = signal["timestamp"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    title = str(signal.get("title") or "XAUUSD Focus Signal")
+    instrument = signal.get("instrument")
     return "\n".join(
         [
-            "XAUUSD Focus Signal",
+            title,
+            f"Instrument: {instrument}" if instrument else "Instrument: XAU/USD",
             f"Timeframe: {signal['timeframe']}",
             f"Side: {signal['side']}",
             f"Time: {timestamp}",
@@ -577,8 +587,12 @@ class XAUSignalBot:
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.enabled = env_bool("XAU_SIGNAL_BOT_ENABLED", False)
+        self.provider = env_str("XAU_DATA_PROVIDER", "yahoo").strip().lower()
         self.api_key = os.environ.get("TWELVEDATA_API_KEY", "").strip()
+        self.stooq_api_key = os.environ.get("STOOQ_API_KEY", "").strip()
         self.symbol = env_str("XAU_SIGNAL_SYMBOL", "XAU/USD")
+        self.stooq_symbol = env_str("STOOQ_SYMBOL", "xauusd")
+        self.yahoo_symbol = env_str("YAHOO_GOLD_SYMBOL", "GC=F")
         self.state_file = Path(os.environ.get("XAU_SIGNAL_STATE_FILE", DEFAULT_XAU_STATE_FILE))
         self.poll_offset_seconds = env_int("XAU_SIGNAL_OFFSET_SECONDS", 20)
         self.stop_event = threading.Event()
@@ -587,11 +601,36 @@ class XAUSignalBot:
         self.last_run_at: str | None = None
         self.state = load_state(self.state_file)
 
+    def _provider_ready(self) -> bool:
+        if self.provider == "twelvedata":
+            return bool(self.api_key)
+        if self.provider == "stooq":
+            return bool(self.stooq_api_key)
+        if self.provider == "yahoo":
+            return bool(self.yahoo_symbol)
+        return False
+
+    def _display_symbol(self) -> str:
+        if self.provider == "yahoo":
+            return f"{self.yahoo_symbol} (gold futures proxy)"
+        if self.provider == "stooq":
+            return self.stooq_symbol
+        return self.symbol
+
     def start(self) -> None:
         if not self.enabled:
             return
-        if not self.api_key:
+        if self.provider == "twelvedata" and not self.api_key:
             print("XAU signal bot is enabled but TWELVEDATA_API_KEY is missing.")
+            return
+        if self.provider == "stooq" and not self.stooq_api_key:
+            print("XAU signal bot is enabled but STOOQ_API_KEY is missing.")
+            return
+        if self.provider == "yahoo" and not self.yahoo_symbol:
+            print("XAU signal bot is enabled but YAHOO_GOLD_SYMBOL is missing.")
+            return
+        if self.provider not in {"twelvedata", "stooq", "yahoo"}:
+            print(f"XAU signal bot provider '{self.provider}' is not supported.")
             return
         self.thread = threading.Thread(target=self._run_loop, name="xau-signal-bot", daemon=True)
         self.thread.start()
@@ -604,8 +643,9 @@ class XAUSignalBot:
 
     def status(self) -> dict[str, Any]:
         return {
-            "enabled": self.enabled and bool(self.api_key),
-            "symbol": self.symbol,
+            "enabled": self.enabled and self._provider_ready(),
+            "provider": self.provider,
+            "symbol": self._display_symbol(),
             "last_run_at": self.last_run_at,
             "last_error": self.last_error,
         }
@@ -642,10 +682,15 @@ class XAUSignalBot:
         save_state(self.state_file, self.state)
 
     def run_once(self) -> None:
-        candles_5m = fetch_twelvedata_candles(self.api_key, self.symbol, "5min", outputsize=320)
+        if self.provider == "stooq":
+            candles_5m = fetch_stooq_candles(self.stooq_api_key, self.stooq_symbol, "5")
+        elif self.provider == "yahoo":
+            candles_5m = fetch_yahoo_candles(self.yahoo_symbol, interval="5m", range_name="5d")
+        else:
+            candles_5m = fetch_twelvedata_candles(self.api_key, self.symbol, "5min", outputsize=320)
         candles_5m = drop_incomplete_candle(candles_5m, 5)
         if len(candles_5m) < 240:
-            raise RuntimeError("Not enough XAU/USD 5-minute candles returned from Twelve Data.")
+            raise RuntimeError(f"Not enough XAU/USD 5-minute candles returned from {self.provider}.")
 
         candles_15m = aggregate_candles(candles_5m, 15)
         candles_60m = aggregate_candles(candles_5m, 60)
@@ -663,9 +708,119 @@ class XAUSignalBot:
         for signal in signals:
             if self._already_sent(signal["timeframe"], signal["timestamp"], signal["side"]):
                 continue
+            signal["instrument"] = self._display_symbol()
+            signal["title"] = "Gold Proxy Focus Signal" if self.provider == "yahoo" else "XAUUSD Focus Signal"
             post_telegram(self.bot_token, self.chat_id, build_xau_message(signal))
             self._mark_sent(signal["timeframe"], signal["timestamp"], signal["side"])
             print(f"Sent XAU {signal['timeframe']} {signal['side']} signal at {iso_utc(signal['timestamp'])}")
+
+
+def parse_stooq_timestamp(date_value: str, time_value: str | None) -> datetime:
+    date_value = date_value.strip()
+    if not time_value:
+        return datetime.fromisoformat(date_value).replace(tzinfo=timezone.utc)
+    normalized = f"{date_value} {time_value.strip()}"
+    for fmt in ("%Y-%m-%d %H:%M", "%Y%m%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y%m%d %H:%M:%S"):
+        try:
+            return datetime.strptime(normalized, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported Stooq datetime format: {normalized}")
+
+
+def fetch_stooq_candles(api_key: str, symbol: str, interval: str) -> list[Candle]:
+    url = f"https://stooq.com/q/d/l/?s={urllib.parse.quote(symbol)}&i={interval}&apikey={urllib.parse.quote(api_key)}"
+    request = urllib.request.Request(url, headers={"User-Agent": "codex-xau-bot/1.0"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        text = response.read().decode("utf-8", errors="replace")
+    if text.strip().startswith("Get your apikey"):
+        raise RuntimeError("Stooq API key is missing or invalid. Revisit the get_apikey page and copy the new key.")
+    reader = csv.DictReader(io.StringIO(text))
+    candles: list[Candle] = []
+    for row in reader:
+        if not row:
+            continue
+        date_value = row.get("Date") or row.get("date")
+        if not date_value:
+            continue
+        time_value = row.get("Time") or row.get("time")
+        open_price = safe_float(row.get("Open") or row.get("open"))
+        high_price = safe_float(row.get("High") or row.get("high"))
+        low_price = safe_float(row.get("Low") or row.get("low"))
+        close_price = safe_float(row.get("Close") or row.get("close"))
+        if None in (open_price, high_price, low_price, close_price):
+            continue
+        candles.append(
+            Candle(
+                ts=parse_stooq_timestamp(str(date_value), str(time_value) if time_value else None),
+                open=float(open_price),
+                high=float(high_price),
+                low=float(low_price),
+                close=float(close_price),
+            )
+        )
+    if not candles:
+        raise RuntimeError("Stooq returned no candles.")
+    candles.sort(key=lambda candle: candle.ts)
+    return candles
+
+
+def fetch_yahoo_candles(symbol: str, interval: str = "5m", range_name: str = "5d") -> list[Candle]:
+    encoded_symbol = urllib.parse.quote(symbol, safe="")
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded_symbol}"
+        f"?interval={urllib.parse.quote(interval)}&range={urllib.parse.quote(range_name)}&includePrePost=true"
+    )
+    data = get_json(url)
+    if not isinstance(data, dict):
+        raise RuntimeError("Yahoo Finance returned an unexpected response.")
+    chart = data.get("chart")
+    if not isinstance(chart, dict):
+        raise RuntimeError("Yahoo Finance response missing chart data.")
+    error = chart.get("error")
+    if error:
+        message = error.get("description") if isinstance(error, dict) else str(error)
+        raise RuntimeError(f"Yahoo Finance error: {message}")
+    result = chart.get("result")
+    if not isinstance(result, list) or not result:
+        raise RuntimeError("Yahoo Finance returned no chart result.")
+    series = result[0]
+    timestamps = series.get("timestamp")
+    indicators = series.get("indicators")
+    if not isinstance(timestamps, list) or not isinstance(indicators, dict):
+        raise RuntimeError("Yahoo Finance response missing timestamps or indicators.")
+    quote_list = indicators.get("quote")
+    if not isinstance(quote_list, list) or not quote_list:
+        raise RuntimeError("Yahoo Finance response missing OHLC quote data.")
+    quote = quote_list[0]
+    opens = quote.get("open") if isinstance(quote, dict) else None
+    highs = quote.get("high") if isinstance(quote, dict) else None
+    lows = quote.get("low") if isinstance(quote, dict) else None
+    closes = quote.get("close") if isinstance(quote, dict) else None
+    if not all(isinstance(values, list) for values in [opens, highs, lows, closes]):
+        raise RuntimeError("Yahoo Finance response missing OHLC arrays.")
+
+    candles: list[Candle] = []
+    for index, ts_value in enumerate(timestamps):
+        open_price = safe_float(opens[index]) if index < len(opens) else None
+        high_price = safe_float(highs[index]) if index < len(highs) else None
+        low_price = safe_float(lows[index]) if index < len(lows) else None
+        close_price = safe_float(closes[index]) if index < len(closes) else None
+        if None in (open_price, high_price, low_price, close_price):
+            continue
+        candles.append(
+            Candle(
+                ts=parse_yahoo_timestamp(ts_value),
+                open=float(open_price),
+                high=float(high_price),
+                low=float(low_price),
+                close=float(close_price),
+            )
+        )
+    if not candles:
+        raise RuntimeError("Yahoo Finance returned no complete candles.")
+    candles.sort(key=lambda candle: candle.ts)
+    return candles
 
 
 def build_message(payload: Any) -> str:
