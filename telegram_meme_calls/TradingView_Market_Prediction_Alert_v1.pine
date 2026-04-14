@@ -1,0 +1,160 @@
+//@version=6
+indicator("Market Prediction Precision Alerts v1", overlay = true, max_labels_count = 200)
+
+groupTrend = "Trend Filters"
+fastEmaLen = input.int(21, "Fast EMA", minval = 2, group = groupTrend)
+slowEmaLen = input.int(55, "Slow EMA", minval = 3, group = groupTrend)
+trendEmaLen = input.int(200, "Trend EMA", minval = 20, group = groupTrend)
+htfTf = input.timeframe("60", "Higher TF", group = groupTrend)
+htfEmaLen = input.int(200, "Higher TF EMA", minval = 20, group = groupTrend)
+
+groupMomentum = "Momentum Filters"
+rsiLen = input.int(14, "RSI Length", minval = 2, group = groupMomentum)
+rsiLongMin = input.float(53.0, "Long RSI Min", step = 0.1, group = groupMomentum)
+rsiLongMax = input.float(66.0, "Long RSI Max", step = 0.1, group = groupMomentum)
+rsiShortMin = input.float(34.0, "Short RSI Min", step = 0.1, group = groupMomentum)
+rsiShortMax = input.float(47.0, "Short RSI Max", step = 0.1, group = groupMomentum)
+macdFast = input.int(12, "MACD Fast", minval = 2, group = groupMomentum)
+macdSlow = input.int(26, "MACD Slow", minval = 3, group = groupMomentum)
+macdSignalLen = input.int(9, "MACD Signal", minval = 2, group = groupMomentum)
+adxLen = input.int(14, "ADX Length", minval = 2, group = groupMomentum)
+adxMin = input.float(20.0, "ADX Min", step = 0.1, group = groupMomentum)
+
+groupEntry = "Entry Quality"
+breakoutLookback = input.int(5, "Breakout Lookback Bars", minval = 2, group = groupEntry)
+atrLen = input.int(14, "ATR Length", minval = 2, group = groupEntry)
+stopAtr = input.float(1.3, "Stop ATR", minval = 0.2, step = 0.1, group = groupEntry)
+tp1Atr = input.float(1.5, "TP1 ATR", minval = 0.5, step = 0.1, group = groupEntry)
+tp2Atr = input.float(2.4, "TP2 ATR", minval = 0.5, step = 0.1, group = groupEntry)
+maxStretchAtr = input.float(1.1, "Max Distance From Fast EMA (ATR)", minval = 0.1, step = 0.1, group = groupEntry)
+candleBodyMin = input.float(0.45, "Min Candle Body Ratio", minval = 0.05, maxval = 0.95, step = 0.01, group = groupEntry)
+candleCloseZone = input.float(0.65, "Min Close Zone Ratio", minval = 0.05, maxval = 0.95, step = 0.01, group = groupEntry)
+cooldownBars = input.int(4, "Signal Cooldown Bars", minval = 0, group = groupEntry)
+
+groupVolume = "Volume"
+useVolumeFilter = input.bool(true, "Use Volume Filter", group = groupVolume)
+volumeLookback = input.int(20, "Volume SMA Length", minval = 2, group = groupVolume)
+volumeBoost = input.float(1.15, "Volume Boost", minval = 0.5, step = 0.05, group = groupVolume)
+
+groupScoring = "Scoring"
+minScore = input.int(7, "Minimum Score", minval = 1, maxval = 8, group = groupScoring)
+
+groupAlert = "Alert / Webhook"
+webhookSecret = input.string("", "Webhook Secret", group = groupAlert, tooltip = "Set this to the same value as TRADINGVIEW_WEBHOOK_SECRET in the Python webhook service.")
+setupName = input.string("Precision Trend Breakout", "Setup Name", group = groupAlert)
+
+jsonEscape(string source) =>
+    escaped = str.replace_all(source, "\\", "\\\\")
+    escaped := str.replace_all(escaped, "\"", "\\\"")
+    escaped := str.replace_all(escaped, "\n", " ")
+    escaped
+
+float fastEma = ta.ema(close, fastEmaLen)
+float slowEma = ta.ema(close, slowEmaLen)
+float trendEma = ta.ema(close, trendEmaLen)
+float htfEma = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen), lookahead = barmerge.lookahead_off)
+float htfClose = request.security(syminfo.tickerid, htfTf, close, lookahead = barmerge.lookahead_off)
+float rsiValue = ta.rsi(close, rsiLen)
+[macdLine, macdSignal, macdHist] = ta.macd(close, macdFast, macdSlow, macdSignalLen)
+[plusDI, minusDI, adxValue] = ta.dmi(adxLen, adxLen)
+float atrValue = ta.atr(atrLen)
+float avgVolume = ta.sma(volume, volumeLookback)
+float candleRange = math.max(high - low, syminfo.mintick)
+float bodyRatio = math.abs(close - open) / candleRange
+float bullCloseRatio = (close - low) / candleRange
+float bearCloseRatio = (high - close) / candleRange
+float priceStretchAtr = atrValue > 0 ? math.abs(close - fastEma) / atrValue : 999.0
+float volumeRatio = avgVolume > 0 ? volume / avgVolume : 1.0
+
+bool trendUp = close > fastEma and fastEma > slowEma and slowEma > trendEma
+bool trendDown = close < fastEma and fastEma < slowEma and slowEma < trendEma
+bool htfTrendUp = htfClose > htfEma
+bool htfTrendDown = htfClose < htfEma
+bool adxBull = adxValue >= adxMin and plusDI > minusDI
+bool adxBear = adxValue >= adxMin and minusDI > plusDI
+bool macdBull = macdLine > macdSignal and macdHist > 0
+bool macdBear = macdLine < macdSignal and macdHist < 0
+bool rsiBull = rsiValue >= rsiLongMin and rsiValue <= rsiLongMax
+bool rsiBear = rsiValue >= rsiShortMin and rsiValue <= rsiShortMax
+bool volumeOk = not useVolumeFilter or avgVolume <= 0 or volumeRatio >= volumeBoost
+bool candleBull = close > open and bodyRatio >= candleBodyMin and bullCloseRatio >= candleCloseZone
+bool candleBear = close < open and bodyRatio >= candleBodyMin and bearCloseRatio >= candleCloseZone
+bool stretchOk = priceStretchAtr <= maxStretchAtr
+bool breakoutBull = close > ta.highest(high, breakoutLookback)[1]
+bool breakoutBear = close < ta.lowest(low, breakoutLookback)[1]
+
+int longScore = 0
+longScore += trendUp ? 1 : 0
+longScore += htfTrendUp ? 1 : 0
+longScore += adxBull ? 1 : 0
+longScore += macdBull ? 1 : 0
+longScore += rsiBull ? 1 : 0
+longScore += volumeOk ? 1 : 0
+longScore += candleBull ? 1 : 0
+longScore += stretchOk ? 1 : 0
+
+int shortScore = 0
+shortScore += trendDown ? 1 : 0
+shortScore += htfTrendDown ? 1 : 0
+shortScore += adxBear ? 1 : 0
+shortScore += macdBear ? 1 : 0
+shortScore += rsiBear ? 1 : 0
+shortScore += volumeOk ? 1 : 0
+shortScore += candleBear ? 1 : 0
+shortScore += stretchOk ? 1 : 0
+
+var int lastLongBar = na
+var int lastShortBar = na
+bool longCooldownOk = na(lastLongBar) or bar_index - lastLongBar > cooldownBars
+bool shortCooldownOk = na(lastShortBar) or bar_index - lastShortBar > cooldownBars
+
+bool longSignal = barstate.isconfirmed and longCooldownOk and breakoutBull and longScore >= minScore
+bool shortSignal = barstate.isconfirmed and shortCooldownOk and breakoutBear and shortScore >= minScore
+
+float longStop = close - atrValue * stopAtr
+float longTp1 = close + atrValue * tp1Atr
+float longTp2 = close + atrValue * tp2Atr
+float shortStop = close + atrValue * stopAtr
+float shortTp1 = close - atrValue * tp1Atr
+float shortTp2 = close - atrValue * tp2Atr
+
+float longConfidence = longScore * 100.0 / 8.0
+float shortConfidence = shortScore * 100.0 / 8.0
+
+buildAlertMessage(string side, float stopPrice, float tp1Price, float tp2Price, int score, float confidence) =>
+    "{" +
+      "\"passphrase\":\"" + jsonEscape(webhookSecret) + "\"," +
+      "\"source\":\"TradingView\"," +
+      "\"script\":\"" + jsonEscape(setupName) + "\"," +
+      "\"ticker\":\"" + jsonEscape(syminfo.tickerid) + "\"," +
+      "\"interval\":\"" + jsonEscape(timeframe.period) + "\"," +
+      "\"side\":\"" + side + "\"," +
+      "\"price\":" + str.tostring(close, format.mintick) + "," +
+      "\"stop\":" + str.tostring(stopPrice, format.mintick) + "," +
+      "\"tp1\":" + str.tostring(tp1Price, format.mintick) + "," +
+      "\"tp2\":" + str.tostring(tp2Price, format.mintick) + "," +
+      "\"score\":" + str.tostring(score) + "," +
+      "\"confidence\":" + str.tostring(confidence, "#.##") + "," +
+      "\"atr\":" + str.tostring(atrValue, format.mintick) + "," +
+      "\"volume_ratio\":" + str.tostring(volumeRatio, "#.##") +
+    "}"
+
+if longSignal
+    lastLongBar := bar_index
+    alert(buildAlertMessage("BUY", longStop, longTp1, longTp2, longScore, longConfidence), alert.freq_once_per_bar_close)
+
+if shortSignal
+    lastShortBar := bar_index
+    alert(buildAlertMessage("SELL", shortStop, shortTp1, shortTp2, shortScore, shortConfidence), alert.freq_once_per_bar_close)
+
+plot(fastEma, "Fast EMA", color = color.new(color.teal, 0), linewidth = 2)
+plot(slowEma, "Slow EMA", color = color.new(color.orange, 0), linewidth = 2)
+plot(trendEma, "Trend EMA", color = color.new(color.gray, 35), linewidth = 2)
+
+plotshape(longSignal, title = "BUY", text = "BUY", style = shape.labelup, location = location.belowbar, color = color.new(color.lime, 0), textcolor = color.black, size = size.tiny)
+plotshape(shortSignal, title = "SELL", text = "SELL", style = shape.labeldown, location = location.abovebar, color = color.new(color.red, 0), textcolor = color.white, size = size.tiny)
+
+bgcolor(longScore >= minScore and trendUp ? color.new(color.lime, 92) : shortScore >= minScore and trendDown ? color.new(color.red, 92) : na)
+
+alertcondition(longSignal, "Long Precision Signal", "Long Precision Signal")
+alertcondition(shortSignal, "Short Precision Signal", "Short Precision Signal")
