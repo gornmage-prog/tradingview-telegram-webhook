@@ -1,0 +1,2 @@
+# Standard-library only app. This file is present so hosts like Render/Railway
+# can run a normal Python build step without extra dependencies.
