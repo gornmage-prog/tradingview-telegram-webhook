@@ -35,6 +35,8 @@ YAHOO_GOLD_SYMBOL=GC=F
 XAU_SIGNAL_OFFSET_SECONDS=20
 XAU_SIGNAL_BACKFILL_HOURS=6
 XAU_SIGNAL_MAX_SEND_PER_RUN=6
+XAU_SIGNAL_MAX_AGE_M5_MINUTES=20
+XAU_SIGNAL_MAX_AGE_M15_MINUTES=45
 ```
 
 แบบ Stooq:
@@ -83,3 +85,5 @@ https://tradingview-telegram-webhook-voug.onrender.com/healthz
 - ถ้า feed ของโบรกเกอร์กับ futures ต่างกันเล็กน้อย จุดเข้าอาจไม่เท่ากันเป๊ะ
 - เวอร์ชันนี้ดึง `5m`, `15m`, `60m` แยกกันเพื่อให้ `M15` คำนวณได้จริง
 - ถ้า Render หลับไปชั่วคราว ระบบจะพยายาม backfill สัญญาณล่าสุดที่ยังไม่ถูกส่งเมื่อมันตื่นกลับมา
+- ระบบจะกรองอายุสัญญาณก่อนส่ง เพื่อไม่ให้แจ้งเตือนเก่าเกินไป
+- ข้อความจะแสดง `Current Proxy` และ `Signal Age` เพื่อให้เห็นว่าราคาตอนส่งต่างจากราคา entry แค่ไหน
