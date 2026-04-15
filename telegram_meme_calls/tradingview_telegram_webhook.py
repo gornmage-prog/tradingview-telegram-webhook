@@ -162,13 +162,13 @@ XAU_M15_CONFIG = SignalConfig(
     slow_ema=55,
     trend_ema=200,
     rsi_period=14,
-    rsi_long_min=54.0,
+    rsi_long_min=52.0,
     rsi_long_max=67.5,
     rsi_short_min=32.5,
-    rsi_short_max=46.0,
+    rsi_short_max=48.0,
     adx_period=14,
-    adx_min=22.0,
-    breakout_lookback=6,
+    adx_min=18.0,
+    breakout_lookback=4,
     atr_period=14,
     stop_atr=1.6,
     tp1_atr=2.0,
@@ -177,7 +177,7 @@ XAU_M15_CONFIG = SignalConfig(
     candle_body_min=0.45,
     candle_close_zone=0.68,
     max_candle_atr=2.8,
-    min_score=7,
+    min_score=6,
     session_start_utc=6,
     session_end_utc=21,
 )
@@ -595,6 +595,8 @@ class XAUSignalBot:
         self.yahoo_symbol = env_str("YAHOO_GOLD_SYMBOL", "GC=F")
         self.state_file = Path(os.environ.get("XAU_SIGNAL_STATE_FILE", DEFAULT_XAU_STATE_FILE))
         self.poll_offset_seconds = env_int("XAU_SIGNAL_OFFSET_SECONDS", 20)
+        self.backfill_hours = env_int("XAU_SIGNAL_BACKFILL_HOURS", 6)
+        self.max_send_per_run = env_int("XAU_SIGNAL_MAX_SEND_PER_RUN", 6)
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.last_error: str | None = None
@@ -616,6 +618,12 @@ class XAUSignalBot:
         if self.provider == "stooq":
             return self.stooq_symbol
         return self.symbol
+
+    def _prepare_signal(self, signal: dict[str, Any]) -> dict[str, Any]:
+        prepared = dict(signal)
+        prepared["instrument"] = self._display_symbol()
+        prepared["title"] = "Gold Proxy Focus Signal" if self.provider == "yahoo" else "XAUUSD Focus Signal"
+        return prepared
 
     def start(self) -> None:
         if not self.enabled:
@@ -681,38 +689,79 @@ class XAUSignalBot:
         self.state["signals"] = dict(items[-200:])
         save_state(self.state_file, self.state)
 
-    def run_once(self) -> None:
+    def _fetch_candle_sets(self) -> tuple[list[Candle], list[Candle], list[Candle], list[Candle]]:
         if self.provider == "stooq":
             candles_5m = fetch_stooq_candles(self.stooq_api_key, self.stooq_symbol, "5")
         elif self.provider == "yahoo":
             candles_5m = fetch_yahoo_candles(self.yahoo_symbol, interval="5m", range_name="5d")
+            candles_15m = fetch_yahoo_candles(self.yahoo_symbol, interval="15m", range_name="1mo")
+            candles_60m = fetch_yahoo_candles(self.yahoo_symbol, interval="60m", range_name="1mo")
         else:
             candles_5m = fetch_twelvedata_candles(self.api_key, self.symbol, "5min", outputsize=320)
         candles_5m = drop_incomplete_candle(candles_5m, 5)
         if len(candles_5m) < 240:
             raise RuntimeError(f"Not enough XAU/USD 5-minute candles returned from {self.provider}.")
 
-        candles_15m = aggregate_candles(candles_5m, 15)
-        candles_60m = aggregate_candles(candles_5m, 60)
+        candles_15m_for_m5 = aggregate_candles(candles_5m, 15)
+        if self.provider == "yahoo":
+            candles_15m = drop_incomplete_candle(candles_15m, 15)
+            candles_60m = drop_incomplete_candle(candles_60m, 60)
+        else:
+            candles_15m = candles_15m_for_m5
+            candles_60m = aggregate_candles(candles_5m, 60)
+
+        return candles_5m, candles_15m_for_m5, candles_15m, candles_60m
+
+    def _collect_recent_candidates(
+        self,
+        candles: list[Candle],
+        htf_candles: list[Candle],
+        config: SignalConfig,
+    ) -> list[dict[str, Any]]:
+        if not candles or not htf_candles:
+            return []
+        lookback_bars = max(1, int(math.ceil((self.backfill_hours * 60) / config.interval_minutes)))
+        start_index = max(1, len(candles) - lookback_bars + 1)
+        seen_keys: set[str] = set()
+        candidates: list[dict[str, Any]] = []
+        for end_index in range(start_index, len(candles) + 1):
+            latest_ts = candles[end_index - 1].ts
+            htf_prefix = [candle for candle in htf_candles if candle.ts <= latest_ts]
+            signal = evaluate_signal(candles[:end_index], htf_prefix, config)
+            if not signal:
+                continue
+            signal_key = f"{signal['timeframe']}:{iso_utc(signal['timestamp'])}:{signal['side']}"
+            if signal_key in seen_keys:
+                continue
+            seen_keys.add(signal_key)
+            candidates.append(signal)
+        return candidates
+
+    def run_once(self) -> None:
+        candles_5m, candles_15m_for_m5, candles_15m, candles_60m = self._fetch_candle_sets()
         self.last_run_at = iso_utc(utc_now())
 
-        signals: list[dict[str, Any]] = []
-        m15_signal = evaluate_signal(candles_15m, candles_60m, XAU_M15_CONFIG)
-        if m15_signal:
-            signals.append(m15_signal)
+        signals = self._collect_recent_candidates(candles_15m, candles_60m, XAU_M15_CONFIG)
+        signals.extend(self._collect_recent_candidates(candles_5m, candles_15m_for_m5, XAU_M5_CONFIG))
+        signals.sort(key=lambda signal: (signal["timestamp"], 0 if signal["timeframe"] == "M15" else 1))
 
-        m5_signal = evaluate_signal(candles_5m, candles_15m, XAU_M5_CONFIG)
-        if m5_signal:
-            signals.append(m5_signal)
+        pending_signals = [
+            signal
+            for signal in signals
+            if not self._already_sent(signal["timeframe"], signal["timestamp"], signal["side"])
+        ]
+        if len(pending_signals) > self.max_send_per_run:
+            pending_signals = pending_signals[-self.max_send_per_run :]
 
-        for signal in signals:
-            if self._already_sent(signal["timeframe"], signal["timestamp"], signal["side"]):
-                continue
-            signal["instrument"] = self._display_symbol()
-            signal["title"] = "Gold Proxy Focus Signal" if self.provider == "yahoo" else "XAUUSD Focus Signal"
-            post_telegram(self.bot_token, self.chat_id, build_xau_message(signal))
+        sent_count = 0
+        for signal in pending_signals:
+            prepared_signal = self._prepare_signal(signal)
+            post_telegram(self.bot_token, self.chat_id, build_xau_message(prepared_signal))
             self._mark_sent(signal["timeframe"], signal["timestamp"], signal["side"])
+            sent_count += 1
             print(f"Sent XAU {signal['timeframe']} {signal['side']} signal at {iso_utc(signal['timestamp'])}")
+            if sent_count >= self.max_send_per_run:
+                break
 
 
 def parse_stooq_timestamp(date_value: str, time_value: str | None) -> datetime:
