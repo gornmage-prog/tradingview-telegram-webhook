@@ -33,6 +33,8 @@ XAU_SIGNAL_BOT_ENABLED=true
 XAU_DATA_PROVIDER=yahoo
 YAHOO_GOLD_SYMBOL=GC=F
 XAU_SIGNAL_OFFSET_SECONDS=20
+XAU_SIGNAL_BACKFILL_HOURS=6
+XAU_SIGNAL_MAX_SEND_PER_RUN=6
 ```
 
 แบบ Stooq:
@@ -79,3 +81,5 @@ https://tradingview-telegram-webhook-voug.onrender.com/healthz
 หมายเหตุ:
 - โหมด `yahoo` ใช้ `GC=F` เป็น proxy ไม่ใช่ spot XAU/USD ตรงจากโบรกเกอร์
 - ถ้า feed ของโบรกเกอร์กับ futures ต่างกันเล็กน้อย จุดเข้าอาจไม่เท่ากันเป๊ะ
+- เวอร์ชันนี้ดึง `5m`, `15m`, `60m` แยกกันเพื่อให้ `M15` คำนวณได้จริง
+- ถ้า Render หลับไปชั่วคราว ระบบจะพยายาม backfill สัญญาณล่าสุดที่ยังไม่ถูกส่งเมื่อมันตื่นกลับมา
