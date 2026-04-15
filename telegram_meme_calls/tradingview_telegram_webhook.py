@@ -562,6 +562,9 @@ def build_xau_message(signal: dict[str, Any]) -> str:
     timestamp = signal["timestamp"].astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     title = str(signal.get("title") or "XAUUSD Focus Signal")
     instrument = signal.get("instrument")
+    current_price = signal.get("current_price")
+    age_minutes = signal.get("age_minutes")
+    drift_points = signal.get("drift_points")
     return "\n".join(
         [
             title,
@@ -569,8 +572,11 @@ def build_xau_message(signal: dict[str, Any]) -> str:
             f"Timeframe: {signal['timeframe']}",
             f"Side: {signal['side']}",
             f"Time: {timestamp}",
+            f"Signal Age: {format_number(age_minutes)} min" if age_minutes is not None else "Signal Age: n/a",
             "",
             f"Entry: {format_number(signal['price'])}",
+            f"Current Proxy: {format_number(current_price)}" if current_price is not None else "Current Proxy: n/a",
+            f"Drift vs Entry: {format_number(drift_points)}" if drift_points is not None else "Drift vs Entry: n/a",
             f"Stop: {format_number(signal['stop'])}",
             f"TP1: {format_number(signal['tp1'])}",
             f"TP2: {format_number(signal['tp2'])}",
@@ -597,10 +603,13 @@ class XAUSignalBot:
         self.poll_offset_seconds = env_int("XAU_SIGNAL_OFFSET_SECONDS", 20)
         self.backfill_hours = env_int("XAU_SIGNAL_BACKFILL_HOURS", 6)
         self.max_send_per_run = env_int("XAU_SIGNAL_MAX_SEND_PER_RUN", 6)
+        self.max_age_m5_minutes = env_int("XAU_SIGNAL_MAX_AGE_M5_MINUTES", 20)
+        self.max_age_m15_minutes = env_int("XAU_SIGNAL_MAX_AGE_M15_MINUTES", 45)
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.last_error: str | None = None
         self.last_run_at: str | None = None
+        self.current_proxy_price: float | None = None
         self.state = load_state(self.state_file)
 
     def _provider_ready(self) -> bool:
@@ -623,7 +632,15 @@ class XAUSignalBot:
         prepared = dict(signal)
         prepared["instrument"] = self._display_symbol()
         prepared["title"] = "Gold Proxy Focus Signal" if self.provider == "yahoo" else "XAUUSD Focus Signal"
+        age_minutes = max(0.0, (utc_now() - prepared["timestamp"]).total_seconds() / 60.0)
+        prepared["age_minutes"] = round(age_minutes, 1)
+        if self.current_proxy_price is not None:
+            prepared["current_price"] = self.current_proxy_price
+            prepared["drift_points"] = round(self.current_proxy_price - float(prepared["price"]), 2)
         return prepared
+
+    def _max_signal_age_minutes(self, timeframe: str) -> int:
+        return self.max_age_m15_minutes if timeframe == "M15" else self.max_age_m5_minutes
 
     def start(self) -> None:
         if not self.enabled:
@@ -694,10 +711,14 @@ class XAUSignalBot:
             candles_5m = fetch_stooq_candles(self.stooq_api_key, self.stooq_symbol, "5")
         elif self.provider == "yahoo":
             candles_5m = fetch_yahoo_candles(self.yahoo_symbol, interval="5m", range_name="5d")
+            if candles_5m:
+                self.current_proxy_price = float(candles_5m[-1].close)
             candles_15m = fetch_yahoo_candles(self.yahoo_symbol, interval="15m", range_name="1mo")
             candles_60m = fetch_yahoo_candles(self.yahoo_symbol, interval="60m", range_name="1mo")
         else:
             candles_5m = fetch_twelvedata_candles(self.api_key, self.symbol, "5min", outputsize=320)
+            if candles_5m:
+                self.current_proxy_price = float(candles_5m[-1].close)
         candles_5m = drop_incomplete_candle(candles_5m, 5)
         if len(candles_5m) < 240:
             raise RuntimeError(f"Not enough XAU/USD 5-minute candles returned from {self.provider}.")
@@ -724,11 +745,15 @@ class XAUSignalBot:
         start_index = max(1, len(candles) - lookback_bars + 1)
         seen_keys: set[str] = set()
         candidates: list[dict[str, Any]] = []
+        now = utc_now()
         for end_index in range(start_index, len(candles) + 1):
             latest_ts = candles[end_index - 1].ts
             htf_prefix = [candle for candle in htf_candles if candle.ts <= latest_ts]
             signal = evaluate_signal(candles[:end_index], htf_prefix, config)
             if not signal:
+                continue
+            age_minutes = (now - signal["timestamp"]).total_seconds() / 60.0
+            if age_minutes > self._max_signal_age_minutes(signal["timeframe"]):
                 continue
             signal_key = f"{signal['timeframe']}:{iso_utc(signal['timestamp'])}:{signal['side']}"
             if signal_key in seen_keys:
